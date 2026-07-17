@@ -1,0 +1,253 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_absolute_error
+import time
+
+# =============================================================================
+# 1. SIMULATION PARAMETERS & MARKET DATA
+# =============================================================================
+np.random.seed(42)
+
+T           = 3.0 #3years
+num_steps   = 100    #100 time intervals
+dt          = T / num_steps #time step
+t_grid      = np.linspace(0, T, num_steps + 1) #timepoints
+num_paths   = 5000 #independent interest paths
+
+r0           = 0.03 #short term interest rate
+a            = 0.1 #mean aversion speed
+sigma        = 0.015 #volatility of short interest rate
+recovery_rate = 0.3 #how much we recover if default
+hazard_rate  = 0.02 #chance of default per year
+notional     = 10_000_000 #principal
+fixed_rate   = 0.03 #contractual rate agreed upon in the interest rate swap.
+swap_type    = 1   # 1 = Payer,pay the fixed rate, receive the float rate
+
+def discount_factor(t):
+    # Model-consistent discounting: P(0,t) under Hull-White at r_t = r0,
+    # rather than a flat-rate assumption, so CVA discounting is consistent
+    # with the stochastic rate model used to generate exposure.
+    return analytical_bond_price(0, t, r0)
+
+def pd_curve(t):
+    return 1 - np.exp(-hazard_rate * t)   #cumulative probability of default by time t
+
+# =============================================================================
+# 2. ANALYTICAL PRICER (ground truth — used only for training data generation)
+# =============================================================================
+def analytical_bond_price(t, T_mat, r_t):
+    if np.isclose(t, T_mat):
+        return np.ones_like(r_t) if hasattr(r_t, '__len__') else 1.0
+    B = (1 - np.exp(-a * (T_mat - t))) / a
+    A = np.exp((B - (T_mat - t)) * (r0 - sigma**2 / (2 * a**2))
+               - (sigma**2 * B**2) / (4 * a))
+    return A * np.exp(-B * r_t)
+
+def analytical_price_swap(t, r_t, fixed_rate, T_mat, notional, side=1):
+    if t >= T_mat:
+        return 0.0
+    remaining_mat  = T_mat - t
+    payment_dates  = np.arange(1, int(np.ceil(remaining_mat)) + 1) + float(int(t))
+    payment_dates  = payment_dates[payment_dates <= T_mat]
+    if len(payment_dates) == 0:
+        return 0.0
+
+    fixed_leg = sum(fixed_rate * analytical_bond_price(t, tau, r_t)
+                    for tau in payment_dates)
+    # Floating leg valued as 1 - P(t,T): standard reset-to-par convention.
+    # Exact at a reset date; between resets it assumes the floating side
+    # resets to par at the *next* payment date, ignoring stub accrual
+    # since the last reset.
+    floating_leg = 1.0 - analytical_bond_price(t, T_mat, r_t)
+
+    swap_value = notional * (floating_leg - fixed_leg)
+    return side * swap_value
+
+# =============================================================================
+# 3. NEURAL NETWORK PRICER
+# =============================================================================
+
+# --- 3a. Generate Training Data ---
+print("Generating training data from analytical pricer...")
+N_train   = 50_000
+t_samples = np.random.uniform(0, T * 0.99, N_train)
+r_samples = np.random.uniform(-0.02, 0.12,  N_train)
+
+y_train = np.array([
+    analytical_price_swap(t_samples[i], r_samples[i], fixed_rate, T, notional, swap_type)
+    for i in range(N_train)
+])
+
+X_train = np.column_stack([t_samples, r_samples])
+
+# --- 3b. Scale Features ---
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+X_scaled = scaler_X.fit_transform(X_train)
+y_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).ravel()
+
+# --- 3c. Train the Network ---
+print("Training neural network pricer...")
+t0 = time.time()
+
+nn_pricer = MLPRegressor(
+    hidden_layer_sizes=(128, 128, 64),
+    activation='relu',
+    max_iter=500,
+    learning_rate_init=0.001,
+    random_state=42,
+    verbose=False
+)
+nn_pricer.fit(X_scaled, y_scaled)
+print(f"Training done in {time.time()-t0:.1f}s")
+
+# --- 3d. Wrapper: vectorised NN pricer ---
+def nn_price_swap(t, r_t_array):
+    """
+    Vectorised NN pricer.
+    t        : scalar time
+    r_t_array: 1D array of short rates (one per MC path)
+    Returns  : 1D array of swap values
+    """
+    X = np.column_stack([np.full(len(r_t_array), t), r_t_array])
+    X_sc = scaler_X.transform(X)
+    y_sc = nn_pricer.predict(X_sc)
+    return scaler_y.inverse_transform(y_sc.reshape(-1, 1)).ravel()
+
+# =============================================================================
+# 4. HULL-WHITE MONTE CARLO 
+# =============================================================================
+print("Running Hull-White Monte Carlo...")
+r_paths = np.zeros((num_steps + 1, num_paths))
+r_paths[0, :] = r0
+
+for t in range(1, num_steps + 1):
+    dW    = np.random.normal(0, np.sqrt(dt), num_paths)
+    theta = a * r0 + (sigma**2 / (2 * a)) * (1 - np.exp(-2 * a * t_grid[t-1]))
+    dr    = (theta - a * r_paths[t-1, :]) * dt + sigma * dW
+    r_paths[t, :] = r_paths[t-1, :] + dr
+
+# =============================================================================
+# 5. EXPOSURE PROFILES — NN PRICER (vectorised, fast)
+# =============================================================================
+print("Computing exposure profiles with NN pricer...")
+t0 = time.time()
+
+mtm_nn       = np.zeros((num_steps + 1, num_paths))
+exposure_nn  = np.zeros((num_steps + 1, num_paths))
+
+for t_idx, t in enumerate(t_grid):
+    if t >= T:
+        continue
+    v = nn_price_swap(t, r_paths[t_idx, :])
+    mtm_nn[t_idx, :]      = v
+    exposure_nn[t_idx, :] = np.maximum(v, 0.0)
+
+print(f"NN exposure profile done in {time.time()-t0:.2f}s")
+
+# --- Analytical benchmark for comparison ---
+print("Computing analytical benchmark (slow loop)...")
+t0 = time.time()
+exposure_analytical = np.zeros((num_steps + 1, num_paths))
+for t_idx, t in enumerate(t_grid):
+    for path in range(num_paths):
+        v = analytical_price_swap(t, r_paths[t_idx, path], fixed_rate, T, notional, swap_type)
+        exposure_analytical[t_idx, path] = max(v, 0.0)
+print(f"Analytical done in {time.time()-t0:.2f}s")
+
+# =============================================================================
+# 6. CVA CALCULATION (using NN exposures)
+# =============================================================================
+ee_nn         = np.mean(exposure_nn, axis=1)
+pfe_nn        = np.percentile(exposure_nn, 95, axis=1)
+ee_analytical = np.mean(exposure_analytical, axis=1)
+
+cva_nn         = 0.0
+cva_analytical = 0.0
+lgd            = 1.0 - recovery_rate
+
+for t in range(1, num_steps + 1):
+    avg_ee_nn   = 0.5 * (ee_nn[t-1]         + ee_nn[t])
+    avg_ee_an   = 0.5 * (ee_analytical[t-1] + ee_analytical[t])
+    t_mid       = 0.5 * (t_grid[t-1]        + t_grid[t])
+    df          = discount_factor(t_mid)
+    dPD         = pd_curve(t_grid[t]) - pd_curve(t_grid[t-1])
+    cva_nn         += lgd * avg_ee_nn * df * dPD
+    cva_analytical += lgd * avg_ee_an * df * dPD
+
+print("\n--- Risk Metrics Summary ---")
+print(f"{'Metric':<35} {'NN Pricer':>15} {'Analytical':>15}")
+print("-" * 65)
+print(f"{'Peak Expected Exposure':<35} ${np.max(ee_nn):>14,.0f} ${np.max(ee_analytical):>14,.0f}")
+print(f"{'Maximum PFE (95%)':<35} ${np.max(pfe_nn):>14,.0f}")
+print(f"{'CVA':<35} ${cva_nn:>14,.2f} ${cva_analytical:>14,.2f}")
+print(f"{'CVA Error':<35} ${abs(cva_nn - cva_analytical):>14,.2f}")
+
+# =============================================================================
+# 7. VISUALIZATION
+# =============================================================================
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle("CVA Pipeline: Neural Network Pricer vs Analytical", fontsize=14, fontweight='bold')
+
+# Plot 1 — EE comparison
+ax = axes[0, 0]
+ax.plot(t_grid, ee_analytical, color='blue',   linewidth=2.5, label='Analytical EE')
+ax.plot(t_grid, ee_nn,         color='orange', linewidth=2,   linestyle='--', label='NN EE')
+ax.set_title('Expected Exposure: NN vs Analytical')
+ax.set_xlabel('Time (Years)')
+ax.set_ylabel('Exposure ($)')
+ax.legend()
+ax.grid(True)
+
+# Plot 2 — PFE and sample paths (NN)
+ax = axes[0, 1]
+ax.plot(t_grid, exposure_nn[:, :15], color='gray', alpha=0.3)
+ax.plot(t_grid, ee_nn,    color='blue',   linewidth=2.5, label='EE (NN)')
+ax.plot(t_grid, pfe_nn,   color='red',    linestyle='--', linewidth=2, label='95% PFE (NN)')
+ax.set_title('NN Exposure Profiles & Risk Metrics')
+ax.set_xlabel('Time (Years)')
+ax.set_ylabel('Exposure ($)')
+ax.legend()
+ax.grid(True)
+
+# Plot 3 — NN prediction accuracy on held-out test set
+ax = axes[1, 0]
+N_test    = 5000
+t_test    = np.random.uniform(0, T * 0.99, N_test)
+r_test    = np.random.uniform(-0.02, 0.12,  N_test)
+y_true    = np.array([analytical_price_swap(t_test[i], r_test[i], fixed_rate, T, notional, swap_type)
+                      for i in range(N_test)])
+X_test_sc = scaler_X.transform(np.column_stack([t_test, r_test]))
+y_pred    = scaler_y.inverse_transform(nn_pricer.predict(X_test_sc).reshape(-1,1)).ravel()
+r2 = r2_score(y_true, y_pred)
+mae = mean_absolute_error(y_true, y_pred)
+print(f"NN Pricer — R²: {r2:.4f}, MAE: ${mae:,.0f}")
+
+ax.text(0.05, 0.95, f'R² = {r2:.4f}\nMAE = ${mae:,.0f}',
+        transform=ax.transAxes, fontsize=10, va='top',
+        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+ax.scatter(y_true / 1e6, y_pred / 1e6, alpha=0.2, s=5, color='steelblue')
+lims = [min(y_true.min(), y_pred.min()) / 1e6, max(y_true.max(), y_pred.max()) / 1e6]
+ax.plot(lims, lims, 'r--', linewidth=1.5, label='Perfect fit')
+ax.set_title('NN Pricer Accuracy (Test Set)')
+ax.set_xlabel('Analytical Price ($M)')
+ax.set_ylabel('NN Predicted Price ($M)')
+ax.legend()
+ax.grid(True)
+
+# Plot 4 — Short rate paths
+ax = axes[1, 1]
+ax.plot(t_grid, r_paths[:, :30], alpha=0.4)
+ax.axhline(r0, color='black', linestyle='--', label='Initial Rate (r₀)')
+ax.set_title('Sample Simulated Short Rate Paths (Hull-White)')
+ax.set_xlabel('Time (Years)')
+ax.set_ylabel('Short Rate')
+ax.legend()
+ax.grid(True)
+
+plt.tight_layout()
+plt.savefig('CVA_with_NN.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("\nPlot saved.")
